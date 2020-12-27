@@ -3,7 +3,7 @@ package pbservice
 import "viewservice"
 import "net/rpc"
 import "fmt"
-
+import "time"
 import "crypto/rand"
 import "math/big"
 
@@ -78,16 +78,34 @@ func call(srv string, rpcname string,
 //
 func (ck *Clerk) Get(key string) string {
 	// Your code here.
-
+	
 	//  1. Prepare the arguments
-	
-
+	if ck.currView.Primary == ""{
+		ck.currView,_ = ck.vs.Get()
+	}
+	args:=&GetArgs{}
+	args.Key = key
+	args.Id=nrand()
+	var reply GetReply
 	//  2. Send an RPC request, wait for the reply
-	
+	for reply.Err != OK{
+		call(ck.currView.Primary,"PBServer.Get",args,&reply)
+		if reply.Err == ErrNoKey{
+			break
+		}
+		if reply.Err == ErrWrongServer{
+			ck.currView,_ = ck.vs.Get()
+			call(ck.currView.Primary,"PBServer.Get",args,&reply)
+		}
+		time.Sleep(time.Millisecond*100)
+		if reply.Err == ""{
+			ck.currView,_ = ck.vs.Get()
+		}
+	}
 
 	//  3. Keep retrying until we get an answer	
 
-	return ""
+	return reply.Value
 }
 
 
@@ -98,9 +116,39 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// Your code here.
 
 	//  1. Prepare the arguments
-
+	if ck.currView.Primary == ""{
+		ck.currView,_ = ck.vs.Get()
+	}
+	
+	args:=&PutAppendArgs{}
+	args.Key = key
+	args.Value = value
+	args.Op = op
+	args.Id = nrand()
+	var reply PutAppendReply
 	//  2. Send an RPC request, wait for the reply
-
+	i:=0
+	for reply.Err != OK{
+		i+=1
+		call(ck.currView.Primary,"PBServer.PutAppend",args,&reply)
+		
+		if reply.Err == ErrWrongServer{
+			ck.currView,_ = ck.vs.Get()
+			call(ck.currView.Primary,"PBServer.PutAppend",args,&reply)
+		}
+		time.Sleep(time.Millisecond*500)
+		if reply.Err == OK{
+				break
+		}
+		ck.currView,_ = ck.vs.Get()
+		
+		if ck.currView.Primary == ""{
+				break
+		}
+		if i>7{
+				break
+		}
+	}
 	//  3. Keep retrying until we get an answer
 	
 }

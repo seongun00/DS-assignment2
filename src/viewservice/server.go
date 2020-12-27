@@ -22,6 +22,8 @@ type ViewServer struct {
 	pingTimeMap          map[string]time.Time  //  keeps track of most recent time VS heard ping from each server
 	primaryAckedCurrView bool                  //  keeps track of whether primary has ACKed the current view
 	idleServer           string                //  keeps track of any idle servers
+	cvar				bool				//상태 확인 변수
+	reset				bool				//
 }
 
 
@@ -35,8 +37,98 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 	// Your code here.	
 
 	// 1. Update ping times for current server
-	
+	vs.pingTimeMap[args.Me]=time.Now()
 	// 2. Update view and/or idle server if reboot or new server, or ACK the current view
+	if vs.currView.Primary==""&& vs.currView.Viewnum==args.Viewnum{
+		vs.currView.Primary=args.Me
+		vs.currView.Viewnum+=1
+		reply.View=vs.currView
+		
+	}else{
+		
+		if args.Me==vs.currView.Primary{
+			
+			if args.Viewnum==0{
+				
+				if vs.reset==true{
+					
+					vs.currView.Viewnum+=1
+					vs.reset = false
+					vs.cvar = false
+					reply.View=vs.currView
+					
+				}else{
+					
+					vs.currView.Viewnum+=1
+					vs.currView.Primary = vs.currView.Backup
+					vs.currView.Backup = vs.idleServer
+					vs.idleServer = ""
+					vs.cvar = true
+					reply.View = vs.currView
+					
+				
+				}
+			}else{
+				if args.Viewnum == vs.currView.Viewnum{
+					vs.primaryAckedCurrView = true
+				}
+				
+				if vs.reset == true{
+					vs.currView.Viewnum+=1
+					vs.reset = false
+				}
+				reply.View = vs.currView
+				
+				
+				if vs.primaryAckedCurrView == true && vs.cvar == true{
+					vs.cvar = false
+				}
+			}
+		}else{
+			
+			if vs.currView.Backup==""{
+				vs.currView.Backup=args.Me
+				vs.cvar = true
+				vs.currView.Viewnum+=1
+				reply.View = vs.currView
+				vs.primaryAckedCurrView = false
+				
+			}else{
+				
+				if args.Me == vs.currView.Backup{
+					if args.Viewnum == 0 && vs.currView.Viewnum!=0&&vs.primaryAckedCurrView==true{
+						if vs.idleServer!=""{
+							vs.currView.Viewnum+=1
+							k:=vs.currView.Backup
+							vs.currView.Backup=vs.idleServer
+							vs.idleServer= k
+							vs.cvar = true
+							
+						}else{
+							
+							vs.cvar = true
+						}
+						
+						reply.View= vs.currView
+						
+					}else{
+						reply.View = vs.currView
+					}
+					
+				}else{
+					if vs.idleServer == ""{
+						vs.idleServer=args.Me
+						reply.View=vs.currView
+						
+						
+					}else{
+						reply.View=vs.currView
+					}
+				}
+				
+			}
+		}
+	}
 
 	return nil
 }
@@ -50,8 +142,8 @@ func (vs *ViewServer) Get(args *GetArgs, reply *GetReply) error {
 	defer vs.mu.Unlock()
 
 	// Your code here.	
-
 	// Add view to the reply message
+	reply.View=vs.currView
 
 	return nil
 }
@@ -69,10 +161,38 @@ func (vs *ViewServer) tick() {
 	// Your code here.	
 
 	// 1. No recent pings from the idle server
+	if vs.pingTimeMap[vs.idleServer].UnixNano()!=6795364578871345152{
+		
+		if vs.primaryAckedCurrView == true && time.Now().UnixNano()-vs.pingTimeMap[vs.idleServer].UnixNano()>DeadPings*int64(PingInterval){
+		vs.idleServer=""	
+		}
+	}
+	
 
 	// 2. No recent pings from the backup
+	if vs.pingTimeMap[vs.currView.Backup].UnixNano()!= 6795364578871345152{
+		if vs.primaryAckedCurrView==true && time.Now().UnixNano()-vs.pingTimeMap[vs.currView.Backup].UnixNano()>DeadPings*int64(PingInterval){
+			
+			vs.currView.Backup=vs.idleServer
+			vs.idleServer = ""
+			
+		}
+	}
+	
 
 	// 3. No recent pings from the primary
+	if vs.pingTimeMap[vs.currView.Primary].UnixNano()!=6795364578871345152{
+		
+		if vs.primaryAckedCurrView == true && time.Now().UnixNano()-vs.pingTimeMap[vs.currView.Primary].UnixNano()>DeadPings*int64(PingInterval){
+			vs.currView.Primary = vs.currView.Backup
+			vs.currView.Backup= vs.idleServer
+			vs.idleServer=""
+			
+			vs.reset = true
+			vs.cvar = true
+					fmt.Println("primary dead")
+		}
+	}
 	
 }
 
