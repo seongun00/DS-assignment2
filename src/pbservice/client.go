@@ -80,30 +80,22 @@ func (ck *Clerk) Get(key string) string {
 	// Your code here.
 	
 	//  1. Prepare the arguments
-	if ck.currView.Primary == ""{
-		ck.currView,_ = ck.vs.Get()
-	}
-	args:=&GetArgs{}
-	args.Key = key
-	args.Id=nrand()
+	args := &GetArgs{Key: key, Id: nrand()}  //  generate unique request ID to handle dup requests
 	var reply GetReply
-	//  2. Send an RPC request, wait for the reply
-	for reply.Err != OK{
-		call(ck.currView.Primary,"PBServer.Get",args,&reply)
-		if reply.Err == ErrNoKey{
-			break
-		}
-		if reply.Err == ErrWrongServer{
-			ck.currView,_ = ck.vs.Get()
-			call(ck.currView.Primary,"PBServer.Get",args,&reply)
-		}
-		time.Sleep(time.Millisecond*100)
-		if reply.Err == ""{
-			ck.currView,_ = ck.vs.Get()
-		}
-	}
 
-	//  3. Keep retrying until we get an answer	
+	//  Send an RPC request, wait for the reply
+	ok := call(ck.currView.Primary, "PBServer.Get", args, &reply)
+
+	//  Keep retrying until we get an answer	
+	for ok == false || reply.Err == ErrWrongServer {
+		time.Sleep(viewservice.PingInterval)
+		ck.currView, _ = ck.vs.Get()
+		ok = call(ck.currView.Primary, "PBServer.Get", args, &reply)
+	} 
+
+	if reply.Err == ErrNoKey {
+		return ""
+	}
 
 	return reply.Value
 }
@@ -116,41 +108,18 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// Your code here.
 
 	//  1. Prepare the arguments
-	if ck.currView.Primary == ""{
-		ck.currView,_ = ck.vs.Get()
-	}
-	
-	args:=&PutAppendArgs{}
-	args.Key = key
-	args.Value = value
-	args.Op = op
-	args.Id = nrand()
+	args := &PutAppendArgs{Key: key, Value: value, Op: op, Id: nrand()}  //  generate unique request ID to handle dup requests
 	var reply PutAppendReply
-	//  2. Send an RPC request, wait for the reply
-	i:=0
-	for reply.Err != OK{
-		i+=1
-		call(ck.currView.Primary,"PBServer.PutAppend",args,&reply)
-		
-		if reply.Err == ErrWrongServer{
-			ck.currView,_ = ck.vs.Get()
-			call(ck.currView.Primary,"PBServer.PutAppend",args,&reply)
-		}
-		time.Sleep(time.Millisecond*500)
-		if reply.Err == OK{
-				break
-		}
-		ck.currView,_ = ck.vs.Get()
-		
-		if ck.currView.Primary == ""{
-				break
-		}
-		if i>7{
-				break
-		}
+
+	//  Send an RPC request, wait for the reply
+	ok := call(ck.currView.Primary, "PBServer.PutAppend", args, &reply)
+
+	//  Keep retrying until we get an answer
+	for ok == false || reply.Err != OK {
+		time.Sleep(viewservice.PingInterval)
+		ck.currView, _ = ck.vs.Get()
+		ok = call(ck.currView.Primary, "PBServer.PutAppend", args, &reply)
 	}
-	//  3. Keep retrying until we get an answer
-	
 }
 
 

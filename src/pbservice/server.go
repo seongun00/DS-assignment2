@@ -11,7 +11,6 @@ import "sync/atomic"
 import "os"
 import "syscall"
 import "math/rand"
-import "strings"
 
 
 type Pair struct {
@@ -96,26 +95,32 @@ func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
 
-	//  1. If not the primary, send error back to client	
+	//  If not the primary, send error back to client
 	if pb.currView.Primary != pb.me {
 		reply.Err = ErrWrongServer
 		return nil
 	}
-	//  2. Check if we have seen this request before, and if so, return previously calculated value
+
+	//  Check if we have seen this request before, and if so, return previously calculated value
 	if IsDupGet(pb, args, reply) {
 		reply.Value = pb.database[args.Key]
 		reply.Err = OK
 		return nil
 	}
-	//  3. Retrieve key from database (or return empty string if not present)	
+
+	//  Retrieve key from database (or return empty string if not present)
 	pb.ApplyGet(args, reply)
-	pb.syncDatabase = false
-	//  4. Propagate update to the backup server	
+
+	//  Propagate update to the backup server
 	if pb.currView.Backup != "" {
-		gargs := args
-		var greply GetReply
-		call(pb.currView.Backup,"PBServer.FwdGetToBackup",gargs,&greply)
+		//  Send an RPC request, wait for the reply
+		ok := call(pb.currView.Backup, "PBServer.FwdGetToBackup", args, &reply)
+		//  If something went wrong (e.g. server crashed and update didn't go through)
+		if !ok || reply.Err == ErrWrongServer || reply.Value != pb.database[args.Key] {
+			pb.syncDatabase = true
+		}
 	}
+
 	return nil
 }
 
@@ -179,66 +184,30 @@ func (pb *PBServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error 
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
 
-	//  1. If not the primary, send error back to client
+	//  If not the primary, send error back to client
 	if pb.currView.Primary != pb.me {
 		reply.Err = ErrWrongServer
 		return nil
 	}
-	//  2. Check if we have seen this request before
-	dupvar := IsDupPutAppend(pb, args, reply)
-	if dupvar == true{
-		off := strings.Index(pb.database[args.Key],args.Value)
-		if off >= 0{
-			reply.Err = OK
-		}
+
+	//  Check if we have seen this request before
+	if IsDupPutAppend(pb, args, reply) {
+		reply.Err = OK
 		return nil
 	}
-	//  3. Update database
-	if dupvar  == false{
-		reply.Err = OK
-		pb.syncDatabase = false
-		pb.ApplyPutAppend(args, reply)
-		if pb.currView.Backup == ""{
-			time.Sleep(viewservice.PingInterval)
-			if pb.currView.Backup == ""{
-				return nil
-			}
-			pargs := args
-			var preply PutAppendReply
-			for preply.Err != OK{
-				call(pb.currView.Backup,"PBServer.FwdPutAppendToBackup",pargs,&preply)
-				if preply.Err == OK{
-					break
-				}
-				time.Sleep(viewservice.PingInterval)
-				pb.currView,_ = pb.vs.Ping(pb.currView.Viewnum)
-				args:=&FwdDatabaseToBackupArgs{}
-				args.Database=pb.database
-				args.PrevRequests=pb.prevRequests
-				var reply FwdDatabaseToBackupReply
-				call(pb.currView.Backup,"PBServer.FwdDatabaseToBackup",args,&reply)
-			}
-			return nil
-		}else{
-			pargs:=args
-			var preply PutAppendReply
-			for preply.Err != OK{
-				call(pb.currView.Backup,"PBServer.FwdPutAppendToBackup",pargs,&preply)
-				if preply.Err == OK{
-					break
-				}
-				time.Sleep(viewservice.PingInterval)
-				pb.currView,_ = pb.vs.Ping(pb.currView.Viewnum)
-				args:=&FwdDatabaseToBackupArgs{}
-				args.Database=pb.database
-				args.PrevRequests=pb.prevRequests
-				var reply FwdDatabaseToBackupReply
-				call(pb.currView.Backup,"PBServer.FwdDatabaseToBackup",args,&reply)
-			}
-			return nil
+
+	//  Update database
+	pb.ApplyPutAppend(args, reply)
+
+	//  Propagate update to the backup server
+	if pb.currView.Backup != "" {
+		//  Send an RPC request, wait for the reply
+		ok := call(pb.currView.Backup, "PBServer.FwdPutAppendToBackup", args, &reply)
+		//  If something went wrong (e.g. server crashed and update didn't go through), resync next tick
+		if !ok || reply.Err != OK || pb.database[args.Key] != args.Value {
+			pb.syncDatabase = true
 		}
 	}
-	//  4. Propagate update to the backup server
 
 	return nil
 }
@@ -278,25 +247,35 @@ func (pb *PBServer) tick() {
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
 
-	//  1. Ping viewservice for current view
-	pb.preView=pb.currView
-	pb.currView, _ = pb.vs.Ping(pb.currView.Viewnum)
-	//  2. Backup added to view, primary should send it's complete k/v database
+	//  Ping viewservice for current view
+	newView, err := pb.vs.Ping(pb.currView.Viewnum)
+	if err != nil {
+		fmt.Errorf("Ping(%v) failed", pb.currView.Viewnum)
+	}
 
-	//  3. Sync primary and backup databases (for complete DB transfer AND Get/Put/Append RPC requests)
-	if pb.me == pb.currView.Primary && pb.preView.Backup!=pb.currView.Backup && pb.currView.Backup!=""{
-		args:=&FwdDatabaseToBackupArgs{}
-		args.Database=pb.database
-		args.PrevRequests=pb.prevRequests
+	//  Backup added to view, primary should send it's complete k/v database
+	if newView.Primary == pb.me && newView.Backup != "" && pb.currView.Backup != newView.Backup {
+		pb.syncDatabase = true
+	}
+
+	//  Sync primary and backup databases (for complete DB transfer AND Get/Put/Append RPC requests)
+	if pb.syncDatabase == true {
+		pb.syncDatabase = false
+
+		//  Prepare the arguments
+		args := &FwdDatabaseToBackupArgs{Database: pb.database, PrevRequests: pb.prevRequests}
 		var reply FwdDatabaseToBackupReply
-		call(pb.currView.Backup,"PBServer.FwdDatabaseToBackup",args,&reply)
-		if reply.Err == OK{
+
+		//  Send an RPC request, wait for the reply
+		ok := call(newView.Backup, "PBServer.FwdDatabaseToBackup", args, &reply)
+		//  If something went wrong, then sync up on next tick
+		if !ok || reply.Err != OK {
 			pb.syncDatabase = true
-		}else{
-			pb.syncDatabase = false
 		}
 	}
-	//  4. Update current view
+
+	//  Update current view
+	pb.currView = newView
 }
 
 
